@@ -1,0 +1,226 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import feedparser
+import requests
+import json
+import time
+import hashlib
+import hmac
+import base64
+import urllib
+from datetime import datetime
+
+
+class RSSMonitor:
+    def __init__(self, rss_url, webhook_url, secret=None):
+        self.rss_url = rss_url
+        self.webhook_url = webhook_url
+        self.secret = secret
+        self.last_entries = set()
+
+    def get_sign(self):
+        if not self.secret or self.secret == "None":
+            return ""
+
+        timestamp = str(round(time.time() * 1000))
+        secret_enc = self.secret.encode('utf-8')
+        string_to_sign = '{}\n{}'.format(timestamp, self.secret)
+        string_to_sign_enc = string_to_sign.encode('utf-8')
+        hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
+        sign = urllib.quote_plus(base64.b64encode(hmac_code))
+        return "&timestamp={}&sign={}".format(timestamp, sign)
+
+    def send_to_dingtalk(self, title, content):
+        url = self.webhook_url + self.get_sign()
+
+        data = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": "## {}\n\n{}\n\n> Time: {}".format(
+                    title, content, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                )
+            }
+        }
+
+        headers = {'Content-Type': 'application/json'}
+        try:
+            print("Sending notification to DingTalk...")
+            response = requests.post(url, data=json.dumps(data), headers=headers, timeout=30)
+            print("DingTalk response status: {}".format(response.status_code))
+            return response.json()
+        except Exception as e:
+            print("Failed to send DingTalk notification: {}".format(e))
+            return {"error": str(e)}
+
+    def parse_rss(self):
+        try:
+            print("Fetching RSS from: {}".format(self.rss_url))
+
+            # First check with HEAD request
+            try:
+                head_response = requests.head(self.rss_url, timeout=10)
+                print("HEAD request status: {}".format(head_response.status_code))
+                content_length = head_response.headers.get('content-length', '0')
+                print("Content-Length: {}".format(content_length))
+
+                if content_length == '0':
+                    print("RSS feed is empty (Content-Length: 0)")
+                    return None
+
+            except Exception as e:
+                print("HEAD request failed: {}, continuing with GET...".format(e))
+
+            # Try GET request with timeout
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+            }
+
+            print("Fetching RSS content...")
+            response = requests.get(self.rss_url, headers=headers, timeout=30)
+            print("GET request status: {}".format(response.status_code))
+            print("Response content length: {}".format(len(response.content)))
+
+            if response.status_code != 200:
+                print("HTTP request failed with status: {}".format(response.status_code))
+                return None
+
+            if len(response.content) == 0:
+                print("Response content is empty")
+                return None
+
+            print("Parsing RSS content...")
+            feed = feedparser.parse(response.content)
+
+            # Check if parsing was successful
+            if not hasattr(feed, 'entries'):
+                print("RSS parsing failed - no entries attribute")
+                return None
+
+            if hasattr(feed, 'bozo') and feed.bozo:
+                print("RSS parsing warning - malformed feed: {}".format(
+                    getattr(feed, 'bozo_exception', 'Unknown error')
+                ))
+
+            print("RSS parsed successfully, found {} entries".format(len(feed.entries)))
+
+            # Print first few entries for debugging
+            for i, entry in enumerate(feed.entries[:3]):
+                print("Entry {}: {}".format(i + 1, entry.get('title', 'No Title')[:100]))
+
+            return feed
+
+        except requests.exceptions.Timeout:
+            print("Request timeout after 30 seconds")
+            return None
+        except requests.exceptions.RequestException as e:
+            print("Request failed: {}".format(e))
+            return None
+        except Exception as e:
+            print("RSS parsing failed: {}".format(e))
+            return None
+
+    def check_new_entries(self):
+        print("Starting to check new entries...")
+        feed = self.parse_rss()
+
+        if not feed:
+            print("No feed data received, skipping this check")
+            return
+
+        if not hasattr(feed, 'entries') or not feed.entries:
+            print("No entries found in feed, skipping this check")
+            return
+
+        print("Processing {} entries...".format(len(feed.entries)))
+        new_entries = []
+        current_entries = set()
+
+        for i, entry in enumerate(feed.entries):
+            entry_title = entry.get('title', 'No Title')[:50]
+            print("Processing entry {}: {}".format(i + 1, entry_title))
+
+            entry_id = entry.get('id', entry.get('link', entry.get('title', str(i))))
+            current_entries.add(entry_id)
+
+            if entry_id not in self.last_entries:
+                new_entries.append(entry)
+                print("  -> New entry found")
+
+        print("Found {} new entries out of {} total".format(len(new_entries), len(feed.entries)))
+
+        # First run, record current entries without sending notifications
+        if not self.last_entries:
+            print("First run, recording {} current entries...".format(len(current_entries)))
+            self.last_entries = current_entries
+            print("Entries recorded successfully, monitoring will start from next check")
+            return
+
+        # Send notifications for new entries
+        if new_entries:
+            print("Sending notifications for {} new entries...".format(len(new_entries)))
+            for entry in new_entries:
+                self.send_notification(entry)
+        else:
+            print("No new entries to notify")
+
+        self.last_entries = current_entries
+        print("Check completed successfully")
+
+    def send_notification(self, entry):
+        title = entry.get('title', 'No Title')
+        summary = entry.get('summary', 'No Description')
+        link = entry.get('link', '')
+        published = entry.get('published', '')
+
+        content = "**Description:** {}\n\n".format(summary[:500])  # Limit length
+        if published:
+            content += "**Published:** {}\n\n".format(published)
+        if link:
+            content += "**Link:** [{}]({})".format(link, link)
+
+        result = self.send_to_dingtalk("Alert: Radware CWAF Status Update", content)
+        print("Notification sent: {} - Result: {}".format(title[:50], result))
+
+
+def main():
+    # Configuration
+    RSS_URL = "https://cwaf.status.radwarecloud.com/history.rss"
+    WEBHOOK_URL = ""
+    SECRET = "None"
+
+    # Create monitor instance
+    monitor = RSSMonitor(RSS_URL, WEBHOOK_URL, SECRET)
+
+    print("RSS Monitor started...")
+    print("Target RSS: {}".format(RSS_URL))
+    print("Check interval: 5 minutes")
+    print("=" * 60)
+
+    while True:
+        try:
+            print("\n[{}] Starting RSS check...".format(datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            start_time = time.time()
+
+            monitor.check_new_entries()
+
+            elapsed = time.time() - start_time
+            print("Check completed in {:.2f} seconds".format(elapsed))
+            print("Next check in 5 minutes...")
+            print("-" * 40)
+
+            time.sleep(300)  # Check every 5 minutes
+
+        except KeyboardInterrupt:
+            print("\nMonitor stopped by user")
+            break
+        except Exception as e:
+            print("Monitor error: {}".format(e))
+            print("Waiting 1 minute before retry...")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
+  
